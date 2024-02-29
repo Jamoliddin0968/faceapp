@@ -1,0 +1,4 @@
+alembic init alembic
+alembic revision --autogenerate
+alembic upgrade head
+sqlacodegen mysql://root:11111111@localhost/garden
