@@ -9,6 +9,7 @@ class User(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(45))
+    full_name = Column(String(50))
 
     encodings = relationship("Encoding", back_populates="user")
 
