@@ -1,41 +1,236 @@
+import os
+import cv2
+import face_recognition
+import tkinter as tk
+from tkinter import filedialog, ttk
+import sqlite3
+from datetime import datetime
+from PIL import Image, ImageTk
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from scipy.spatial.distance import cosine
+import torch
+import numpy as np
+
+
+# Initialize FaceNet model and MTCNN detector
+
+
+
+class FaceRecognitionApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Face Recognition App")
+
+        self.video_source ="rtsp://admin:Baxtiyor_98@192.168.1.64/Streaming/channels/2/" # 0 for webcam, or provide path for video file
+        self.cap = cv2.VideoCapture(0)
+        self.device = torch.device('cpu')
+        self.tr=0
+        self.mtcnn = MTCNN(device=self.device,keep_all=True)
+        self.label = tk.Label(self.root)
+        self.label.pack()
+        self.facenet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+        self.progress = ttk.Progressbar(self.root, orient="horizontal", length=200, mode="indeterminate")
+        self.progress.pack()
+        self.progress.start()
+        self.known_user_embeddings = []
+        # self.known_face_names = []
+
+        self.create_menu()
+
+        # Connect to SQLite database
+        self.conn = sqlite3.connect("attendance.db")
+        self.create_attendance_table()
+
+        # Load known faces
+        self.load_known_faces()
+
+        
+
+        # Schedule face recognition to start after the main loop begins
+        self.root.after(10, self.recognize_faces)
+
+    def create_menu(self):
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        camera_menu = tk.Menu(menubar, tearoff=0)
+        camera_menu.add_command(label="Webcam", command=self.set_webcam)
+        camera_menu.add_command(label="File", command=self.set_video_file)
+        menubar.add_cascade(label="Camera", menu=camera_menu)
+
+        menubar.add_command(label="Attendance", command=self.show_today_attendance)
+
+    def set_webcam(self):
+        self.video_source = 0
+        self.cap = cv2.VideoCapture(self.video_source)
+
+    def set_video_file(self):
+        file_path = filedialog.askopenfilename()
+        if file_path:
+            self.video_source = file_path
+            self.cap = cv2.VideoCapture(self.video_source)
+
+
+
     def create_attendance_table(self):
         cursor = self.conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS attendance
                           (id INTEGER PRIMARY KEY AUTOINCREMENT,
                            name TEXT,
                            date DATE,
-                           status TEXT)''')
+                           status TEXT,
+                           image_filename TEXT)''')
         self.conn.commit()
 
+    def load_known_faces(self):
+        # Load known faces from images and encode them
+        base_dir = "images/users"
+        for user_dir in os.listdir(base_dir):
+            user_id = user_dir  # Assuming user directory name is the user_id
+            user_images_dir = os.path.join(base_dir, user_dir)
 
+            for image_name in os.listdir(user_images_dir):
+                image_path = os.path.join(user_images_dir, image_name)
+                image = Image.open(image_path)
+                img_array = np.array(image)
+                faces, _ = self.mtcnn(img_array, return_prob=True)
+                for face in faces:
+                    if face is not None:
+                        embedding = self.facenet(face.unsqueeze(0)).detach().numpy()[0]
+                        self.known_user_embeddings.append({"user_id": user_id, "embedding": embedding})
 
+    def preprocess_image(self,image: Image.Image):
+        img_array = np.array(image)
+        # Using detect method to get bounding boxes along with faces
+        boxes, _ = self.mtcnn.detect(img_array)
+        faces = self.mtcnn(img_array)
+        return faces, boxes
+
+    def generate_embedding(self,cropped_face: np.ndarray):
+        face_tensor = torch.tensor(cropped_face).to(self.device).unsqueeze(0)
+        embedding = self.facenet(face_tensor).detach().cpu().numpy()[0]
+        return embedding
+    
+
+    
+    def is_attendance_marked(self, name):
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM attendance WHERE name = ? AND date = ?", (name, current_date))
+        count = cursor.fetchone()[0]
+        cursor.close()
+        return count > 0
+
+    def get_today_attendance(self):
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name, status, date, image_filename FROM attendance WHERE date = ?", (current_date,))
+        today_attendance = cursor.fetchall()
+        cursor.close()
+        return today_attendance
+
+    def show_today_attendance(self):
+        # Fetch today's attendance data
+        today_attendance = self.get_today_attendance()
+
+        # Create a new window for displaying attendance data
+        attendance_window = tk.Toplevel(self.root)
+        attendance_window.title("Today's Attendance")
+
+        frame = tk.Frame(attendance_window)
+        frame.pack(expand=True, fill='both')
+
+        # Create a Treeview widget to display attendance data
+        self.tree = ttk.Treeview(frame, columns=('Name', 'Status', 'Date', 'Image'), show='headings')
+        self.tree.heading('Name', text='Name')
+        self.tree.heading('Status', text='Status')
+        self.tree.heading('Date', text='Date')
+        self.tree.heading('Image', text='Image')
+
+        # Insert data into the Treeview
+        for name, status, date, image_filename in today_attendance:
+            # Convert image filename to a PIL Image
+            img = Image.open(image_filename)
+            img = img.resize((200, 200))
+            img = ImageTk.PhotoImage(img)
+
+            # Insert a row into the Treeview with attendance data
+            self.tree.insert('', 'end', values=(name, status, date, img))
+
+        # Pack the Treeview widget
+        self.tree.pack(side='left', expand=True, fill='both')
+
+        # Bind double-click event to display full-size image
+        self.tree.bind("<Double-1>", lambda event: self.display_image(event, today_attendance))
+
+    def display_image(self, event, today_attendance):
+        # Retrieve the selected row from the Treeview
+        item = self.tree.selection()[0]
+        values = self.tree.item(item, 'values')
+
+        # Extract the image filename from the selected row
+        image_filename = values[3]
+
+        # Display the full-size image using PIL
+        image_path = os.path.join("images",image_filename)
+        if os.path.exists(image_path):
+            image = Image.open(image_path)
+            image.show()
+
+    def mark_attendance(self, name, cropped_face):
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        cursor = self.conn.cursor()
+        image_filename = f"{name}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
+        image_path = os.path.join("images",  image_filename)
+
+        # Check if cropped_face is a valid numpy array
+        if isinstance(cropped_face, np.ndarray):
+            cv2.imwrite(image_path, cropped_face)
+            cursor.execute("INSERT INTO attendance (name, date, status, image_filename) VALUES (?, ?, ?, ?)",
+                           (name, current_date, 'Active', image_filename))
+            self.conn.commit()
+        else:
+            pass
+
+        cursor.close()
     def recognize_faces(self):
-
-        # Show progress indicator
         self.progress.start()
 
-        frame = None
+        # frame = None
         for _ in range(20):  # Read and skip 9 frames
         
             ret, frame = self.cap.read()
 
 
-        face_locations = face_recognition.face_locations(frame)
-        face_encodings = face_recognition.face_encodings(frame, face_locations)
+        ret, frame = self.cap.read()
+        if not ret:
+            pass  # Break the loop if there are no frames to read
 
-        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-            matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding)
-            name = "Unknown"
-            if True in matches:
-                first_match_index = matches.index(True)
-                name = self.known_face_names[first_match_index]
-            if not name=="Unknown":
-                if not self.is_attendance_marked(name):
-                    # Mark attendance for the user
-                    self.mark_attendance(name)
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1)
+        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        faces, boxes = self.preprocess_image(pil_img)
 
+        if faces is not None:
+            for face, box in zip(faces, boxes):
+                # Ensure box is not None
+                if box is not None:
+                    x, y, w, h = box
+                    x, y, w, h = int(x), int(y), int(w), int(h) 
+           
+                    embedding = self.generate_embedding(face)
+                    user_id = "unknown"
+                    for saved_embedding in self.known_user_embeddings:
+                        saved_embedding_array = saved_embedding.get('embedding')
+                        score = cosine(saved_embedding_array, embedding)
+                        if score <= 0.4: 
+                            user_id = saved_embedding.get('user_id')
+
+                            if not self.is_attendance_marked(user_id):
+                                cropped_face = frame[y:y+h, x:x+w]
+                                self.mark_attendance(user_id,cropped_face)
+                            
+                            cv2.putText(frame, f"Matched user: {user_id}  {score}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                            break
+                    cv2.rectangle(frame, (x, y), (x + (w-x), y + (h-y)), (0, 255, 0), 2)
         img = Image.fromarray(frame)
         img = ImageTk.PhotoImage(image=img)
         self.label.imgtk = img
@@ -48,47 +243,12 @@
         # Repeat the process
         self.root.after(10, self.recognize_faces)
 
-    def is_attendance_marked(self, name):
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM attendance WHERE name = ? AND date = ?", (name, current_date))
-        count = cursor.fetchone()[0]
-        cursor.close()
-        return count > 0
 
-    def get_today_attendance(self):
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        conn = sqlite3.connect("attendance.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, status,date FROM attendance WHERE date = ?", (current_date,))
-        today_attendance = cursor.fetchall()
-        conn.close()
-        return today_attendance
+    def __del__(self):
+        if self.cap.isOpened():git
+            self.cap.release()
+        self.conn.close()
 
-    
-    def show_today_attendance(self):
-        # Fetch today's attendance data from the database
-        today_attendance = self.get_today_attendance()
-
-        # Create a new window for displaying attendance data
-        attendance_window = tk.Toplevel(self.root)
-        attendance_window.title("Today's Attendance")
-
-        # Create a Treeview widget to display the attendance data as a table
-        tree = ttk.Treeview(attendance_window, columns=('Name', 'Status', 'Date'), show='headings')
-        tree.heading('Name', text='Name')
-        tree.heading('Status', text='Status')
-        tree.heading('Date', text='Date')
-
-        # Insert data into the Treeview
-        for name, status, date in today_attendance:
-            tree.insert('', 'end', values=(name, status, date))
-
-        tree.pack(expand=True, fill='both')
-
-    def mark_attendance(self, name):
-        current_date = datetime.now().strftime("%Y-%m-%d")
-        cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO attendance (name, date, status) VALUES (?, ?, ?)", (name, current_date, 'Active'))
-        self.conn.commit()
-        cursor.close()
+root = tk.Tk()
+app = FaceRecognitionApp(root)
+root.mainloop()
